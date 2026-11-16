@@ -9,10 +9,10 @@ venv/
 cache/
 checkpoints/
 runs/
-data/raw/
-data/processed/
-data/
-datasets/
+/data/raw/
+/data/processed/
+/data/
+/datasets/
 *.zip
 *.tar
 *.tar.xz
