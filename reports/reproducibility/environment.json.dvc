@@ -1,0 +1,5 @@
+outs:
+- md5: 67bef73f2e74aff6985ebcc786f5902c
+  size: 1016
+  hash: md5
+  path: environment.json
