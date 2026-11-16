@@ -178,19 +178,33 @@ For a local-only tracking UI, start it manually from the project root when desir
 
 Then open `http://127.0.0.1:5000`. The runner itself uses the local SQLite URI directly and does not start a server.
 
-## Phase 5: Colab first benchmark
+## Phase 5: first Colab benchmark - PaDiM on MPDD `bracket_black`
 
-The prepared [Colab notebook](notebooks/colab/01_padim_mpdd_bracket_black.ipynb) runs only PaDiM on MPDD `bracket_black` with seed 42 and 256-pixel inputs. It uses the existing data module, benchmark runner, evaluator, and local MLflow configuration. The verified inventory contains 289 official normal training images; with the configured deterministic 10% validation split, expect 260 training and 29 validation images, plus the unchanged official test split of 32 normal and 47 anomalous images with 47 masks. The notebook checks these counts against the checked-in inventory and stops on a mismatch.
+The full experiment completed on a Google Colab Tesla T4. It used all eligible samples for this category: 260 normal training images, 29 normal validation images, and the unchanged official test split of 79 images (32 normal, 47 anomalous, with 47 masks). It used PaDiM with ImageNet-pretrained torchvision ResNet18, 256x256 input, batch size 8, and seed 42. Thresholds were selected from normal-only validation scores at the configured 99.5th percentile; test labels and masks were used only for final evaluation.
 
-The repository has no GitHub remote configured. The notebook therefore supports a user-supplied source ZIP as well as cloning only when a repository URL is explicitly set. Build a source ZIP from this checkout without `.git`, `.venv`, `.cache`, datasets, checkpoints, or MLflow files; include the DVC-hydrated `configs/`, `reports/dataset_audit/`, `reports/model_development/experimental_protocol.md`, and `reports/reproducibility/environment.json` payloads because there is no DVC remote to restore them from. Then upload the ZIP in the source cell. In Colab, mount Drive and put the original MPDD archive at `MyDrive/IndustrialGuardAI/datasets/MPDD (1).zip`; the archive is read-only, while selected verified members are cached under `/content/industrialguard_cache/`.
+| Metric | Result |
+|---|---:|
+| Image AUROC | 0.78125 |
+| Image average precision | 0.76447 |
+| Pixel AUROC | 0.83174 |
+| Pixel average precision | 0.003261 |
+| AUPRO | 0.52453 |
+| Image F1 | 0.21429 |
+| Pixel segmentation F1 | 0.007205 |
+| Training duration | 17.24 s |
+| Inference latency | 10.04 ms/image |
+| Inference throughput | 99.58 images/s |
+| PyTorch peak inference allocation | 112,295,424 bytes |
 
-The notebook checks the active Colab Python, PyTorch, Torchvision, CUDA runtime, GPU, disk, and ResNet18 ImageNet weight cache. It never silently downloads weights. If the `ResNet18_Weights.DEFAULT` checkpoint is absent, follow the notebook's explicit, opt-in download cell and verify its SHA-256 before proceeding. The experiment uses the documented normal-only validation 99.5th-percentile threshold; test labels and masks are used only for final evaluation. Benchmark execution is gated behind a cell setting that defaults to `False` and requires GPU, archive, dependencies, split counts, and pretrained weights to pass first.
+AUROC, average precision, and AUPRO are threshold-free. Dice, IoU, precision, recall, and F1 use thresholds selected from normal-only validation data. The complete metric set, thresholds, test counts, environment, model configuration, and artifact references are recorded in [the machine-readable T4 benchmark report](docs/benchmarks/mpdd_bracket_black_padim_tesla_t4.json). The executed [Colab notebook](notebooks/colab/01_padim_mpdd_bracket_black.ipynb) retains the run output and verification steps. Its weight-download and benchmark switches default to `False`, so reopening and rerunning the notebook does not silently download or train.
 
-The runner's SQLite MLflow database and artifact directory are local to the Colab runtime to avoid relying on SQLite locking over Drive. After the run, the notebook exports the completed attempt, MLflow run artifacts, and a retrieval summary to `MyDrive/IndustrialGuardAI/artifacts/experiments/<experiment-id>/`. It does not copy the dataset cache. This preserves experiment outputs after runtime disconnection; the SQLite tracking database itself is runtime-local, so the exported MLflow artifact bundle and run summary are the portable record. A downloaded experiment folder on Windows includes the checkpoint, metrics, configuration, logs, and representative actual prediction visualizations for local inspection and inference.
+The checkpoint, per-sample test scores/maps/masks, representative visualizations, logs, config, and MLflow run artifacts were exported to `MyDrive/IndustrialGuardAI/artifacts/experiments/mpdd-bracket_black-padim-s42-5f1a9479e4a6/`. MLflow run `9134a8cea01e4a0dbd474adcecf32600` was retrieved after logging. Its SQLite tracking database was local to the temporary Colab runtime; the artifact bundle and run summary are the persistent Drive export. Checkpoints and MLflow databases are not stored in Git.
+
+This repository has no GitHub or DVC remote configured. DVC-tracked configs and audit/report payloads are available in the local checkout and source ZIP, but a GitHub clone alone cannot retrieve those payloads without an approved DVC remote. No repository URL or storage backend is inferred.
 
 ### Resource planning (estimates, not measurements)
 
-The active Windows virtual environment has CPU-only PyTorch (`torch 2.14.0+cpu`) and no CUDA support. The host exposes an NVIDIA GeForce MX550 with 2 GiB VRAM through `nvidia-smi`, below the project's suggested GPU budget; no full benchmark resource consumption has been measured. Start at 256×256. Use batch 8 for PaDiM/PatchCore on a GPU with at least 8 GB VRAM, reducing to 4 or 1 if memory is tight. EfficientAD requires batch 1. At 256-pixel resolution, budget roughly 4–8 GB VRAM for PaDiM/PatchCore and 2–4 GB for EfficientAD; actual peaks depend on GPU, resolution, and PyTorch/CUDA versions. CPU inference is supported but a full run may take days, particularly EfficientAD's configured 70,000 steps per category.
+The active Windows virtual environment has CPU-only PyTorch (`torch 2.14.0+cpu`) and no CUDA support. The host exposes an NVIDIA GeForce MX550 with 2 GiB VRAM through `nvidia-smi`, below the suggested GPU budget. The T4 measurements above apply only to this PaDiM category run; resource estimates for other models/categories remain estimates. Start at 256×256. Use batch 8 for PaDiM/PatchCore on a GPU with at least 8 GB VRAM, reducing to 4 or 1 if memory is tight. EfficientAD requires batch 1. At 256-pixel resolution, budget roughly 4–8 GB VRAM for PaDiM/PatchCore and 2–4 GB for EfficientAD; actual peaks depend on GPU, resolution, and PyTorch/CUDA versions. CPU inference is supported but a full run may take days, particularly EfficientAD's configured 70,000 steps per category.
 
 For time planning only, allow roughly 5–30 minutes per PaDiM/PatchCore category and 1–8 GPU-hours per EfficientAD category. Across 21 categories and all three models, that suggests approximately 25–190 GPU-hours, excluding installation, data extraction, and reruns. These are broad estimates, not measured results. Reserve 5–10 GB for checkpoints and duplicated MLflow checkpoint artifacts, plus the extracted image cache (dataset archive sizes and filesystem compression vary). Sequential runs reduce peak GPU memory; failed attempts retain outputs and therefore consume additional disk space.
 

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "industrialguard-ai"
 version = "0.1.0"
-description = "Read-only archive audit tools for IndustrialGuard AI datasets"
+description = "Industrial visual anomaly detection, evaluation, and reproducible MLOps tools"
 requires-python = ">=3.11"
 dependencies = ["Pillow>=10.0", "torch>=2.2"]
 
