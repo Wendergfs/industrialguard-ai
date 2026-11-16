@@ -1,0 +1,632 @@
+"""Run selected, resumable model/category benchmarks with local MLflow tracking."""
+
+from __future__ import annotations
+
+import argparse
+import csv
+import hashlib
+import json
+import os
+import platform
+import re
+import subprocess
+import sys
+import time
+from datetime import UTC, datetime
+from functools import cache
+from importlib import metadata
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "src"))
+from industrialguard.data.dataset_audit import read_config
+from industrialguard.mlops.tracking import (
+    canonical_json,
+    configure_local_mlflow,
+    dataset_model_macro_rows,
+    experiment_id,
+    latest_attempt_state,
+    metric_scalars,
+    next_attempt_number,
+    redact_config,
+)
+
+ROOT = Path(__file__).resolve().parents[1]
+DATASET_CONFIG = ROOT / "configs" / "dataset.yaml"
+MODEL_CONFIGS = {
+    name: ROOT / "configs" / "models" / f"{name}.yaml"
+    for name in ("padim", "patchcore", "efficientad")
+}
+TRACKED_PACKAGES = (
+    "torch",
+    "torchvision",
+    "anomalib",
+    "numpy",
+    "scipy",
+    "scikit-learn",
+    "mlflow",
+    "dvc",
+    "ruff",
+)
+
+
+def environment_metadata(configs: list[Path], seed: int) -> dict:
+    """Capture portable versions and hashes, deliberately omitting user/host data."""
+    versions = {}
+    for package in TRACKED_PACKAGES:
+        try:
+            versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            versions[package] = None
+    hashes = {
+        path.name: hashlib.sha256(path.read_bytes()).hexdigest() for path in configs
+    }
+    try:
+        import torch
+
+        device = {
+            "cuda_available": torch.cuda.is_available(),
+            "cuda_version": torch.version.cuda,
+        }
+    except ImportError:
+        device = {"cuda_available": False, "cuda_version": None}
+    return {
+        "python": platform.python_version(),
+        "platform": platform.system(),
+        "machine_architecture": platform.machine(),
+        "packages": versions,
+        "seed": seed,
+        "config_sha256": hashes,
+        "torch_device_capability": device,
+    }
+
+
+def _write_json(path: Path, value) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(value, indent=2, sort_keys=True, default=str), encoding="utf-8"
+    )
+
+
+def _safe_text(text: str) -> str:
+    """Avoid persisting local Windows paths in captured command output."""
+    return re.sub(r"(?i)\b[A-Z]:\\[^\r\n\"']+", "<local-path>", text)
+
+
+@cache
+def _resource_fingerprints(
+    dataset: str, model: str, teacher_checkpoint: str | None, penalty_dir: str | None
+) -> dict[str, object]:
+    """Fingerprint dataset inventory and external EfficientAD inputs without paths."""
+    inventory_path = ROOT / "reports" / "dataset_audit" / f"{dataset}_inventory.csv"
+    result: dict[str, object] = {
+        "dataset_inventory_sha256": hashlib.sha256(
+            inventory_path.read_bytes()
+        ).hexdigest()
+        if inventory_path.is_file()
+        else None
+    }
+    source_digest = hashlib.sha256()
+    source_roots = (
+        ROOT / "src" / "industrialguard" / "data",
+        ROOT / "src" / "industrialguard" / "models",
+        ROOT / "src" / "industrialguard" / "evaluation",
+        ROOT / "src" / "industrialguard" / "mlops",
+        ROOT / "scripts" / "train_model.py",
+        ROOT / "scripts" / "evaluate_model.py",
+        ROOT / "scripts" / "run_benchmark.py",
+    )
+    source_files = []
+    for source in source_roots:
+        source_files.extend(source.rglob("*.py") if source.is_dir() else [source])
+    for source in sorted(source_files):
+        source_digest.update(source.relative_to(ROOT).as_posix().encode())
+        source_digest.update(source.read_bytes())
+    result["implementation_sha256"] = source_digest.hexdigest()
+    package_versions = {}
+    for package in TRACKED_PACKAGES:
+        try:
+            package_versions[package] = metadata.version(package)
+        except metadata.PackageNotFoundError:
+            package_versions[package] = None
+    result["environment_sha256"] = hashlib.sha256(
+        canonical_json(
+            {"python": platform.python_version(), "packages": package_versions}
+        ).encode()
+    ).hexdigest()
+    if model == "efficientad":
+        teacher_path = Path(teacher_checkpoint) if teacher_checkpoint else None
+        result["teacher_checkpoint_sha256"] = (
+            hashlib.sha256(teacher_path.read_bytes()).hexdigest()
+            if teacher_path and teacher_path.is_file()
+            else None
+        )
+        penalty_root = Path(penalty_dir) if penalty_dir else None
+        if penalty_root and penalty_root.is_dir():
+            entries = sorted(
+                f"{path.relative_to(penalty_root).as_posix()}:{path.stat().st_size}"
+                for path in penalty_root.rglob("*")
+                if path.is_file()
+            )
+            result["penalty_image_count"] = len(entries)
+            result["penalty_manifest_sha256"] = hashlib.sha256(
+                "\n".join(entries).encode()
+            ).hexdigest()
+        else:
+            result["penalty_image_count"] = None
+            result["penalty_manifest_sha256"] = None
+    return result
+
+
+def _make_run_config(
+    model_name: str,
+    dataset_name: str,
+    category: str,
+    args,
+    output_dir: Path,
+) -> dict:
+    base = read_config(MODEL_CONFIGS[model_name])
+    base.update(
+        dataset=dataset_name,
+        categories=[category],
+        image_size=args.image_size or int(base["image_size"]),
+        batch_size=1
+        if model_name == "efficientad"
+        else (args.batch_size or int(base["batch_size"])),
+        seed=args.seed,
+        device=args.device,
+        checkpoint_dir=str(output_dir / "checkpoints"),
+    )
+    return base
+
+
+def _aggregate(run_root: Path, report_root: Path) -> None:
+    rows = []
+    failures = []
+    for status_path in run_root.glob("*/*/status.json"):
+        status = json.loads(status_path.read_text(encoding="utf-8"))
+        if status.get("state") == "completed":
+            metrics_path = Path(status["metrics_path"])
+            if metrics_path.is_file():
+                report = json.loads(metrics_path.read_text(encoding="utf-8"))
+                for row in report.get("per_category", []):
+                    row.update(dataset=status["dataset"], model_name=status["model"])
+                    row.update(
+                        {
+                            f"runtime_{key}": value
+                            for key, value in report.get("runtime", {}).items()
+                        }
+                    )
+                    row["training_duration_seconds"] = status.get(
+                        "training_duration_seconds"
+                    )
+                    rows.append(row)
+        elif status.get("state") == "failed":
+            failures.append(
+                {
+                    key: status.get(key)
+                    for key in (
+                        "experiment_id",
+                        "dataset",
+                        "category",
+                        "model",
+                        "error",
+                    )
+                }
+            )
+    report_root.mkdir(parents=True, exist_ok=True)
+    fields = sorted({key for row in rows for key in row})
+    with (report_root / "per_category.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
+        writer = csv.DictWriter(stream, fieldnames=fields)
+        if fields:
+            writer.writeheader()
+            writer.writerows(rows)
+    macro_rows = dataset_model_macro_rows(rows)
+    macro_fields = sorted({key for row in macro_rows for key in row})
+    with (report_root / "dataset_macro.csv").open(
+        "w", newline="", encoding="utf-8"
+    ) as stream:
+        writer = csv.DictWriter(stream, fieldnames=macro_fields)
+        if macro_fields:
+            writer.writeheader()
+            writer.writerows(macro_rows)
+    _write_json(report_root / "failures.json", {"failed_experiments": failures})
+
+
+def main() -> int:
+    benchmark_defaults = read_config(ROOT / "configs" / "benchmark.yaml")
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--dataset", required=True, choices=("mpdd", "mvtec", "all"))
+    parser.add_argument(
+        "--model", required=True, choices=("padim", "patchcore", "efficientad", "all")
+    )
+    selection = parser.add_mutually_exclusive_group(required=True)
+    selection.add_argument(
+        "--category", action="append", help="Repeat to select categories"
+    )
+    selection.add_argument("--all-categories", action="store_true")
+    parser.add_argument(
+        "--device",
+        default=benchmark_defaults.get("device", "auto"),
+        help="auto, cpu, cuda, or cuda:N",
+    )
+    parser.add_argument(
+        "--batch-size", type=int, default=benchmark_defaults.get("batch_size", 8)
+    )
+    parser.add_argument(
+        "--image-size", type=int, default=benchmark_defaults.get("image_size", 256)
+    )
+    parser.add_argument("--seed", type=int, default=benchmark_defaults.get("seed", 42))
+    parser.add_argument("--max-steps", type=int)
+    parser.add_argument("--teacher-checkpoint")
+    parser.add_argument("--imagenet-penalty-dir")
+    parser.add_argument(
+        "--allow-pretrained-download",
+        action="store_true",
+        help="Permit torchvision to download missing ImageNet backbone weights",
+    )
+    parser.add_argument("--fail-fast", action="store_true")
+    args = parser.parse_args()
+
+    try:
+        import mlflow
+    except ImportError as exc:
+        raise SystemExit(
+            "MLflow is required: install with `python -m pip install -e .[mlops]`"
+        ) from exc
+
+    dataset_specs = read_config(DATASET_CONFIG)["datasets"]
+    datasets = list(dataset_specs) if args.dataset == "all" else [args.dataset]
+    model_names = list(MODEL_CONFIGS) if args.model == "all" else [args.model]
+    categories_by_dataset = {}
+    for dataset in datasets:
+        known = dataset_specs[dataset]["categories"]
+        categories = known if args.all_categories else args.category
+        unknown = sorted(set(categories) - set(known))
+        if unknown:
+            raise SystemExit(f"Unknown {dataset} categories: {unknown}")
+        categories_by_dataset[dataset] = categories
+    if args.batch_size is not None and args.batch_size < 1:
+        parser.error("--batch-size must be positive")
+    if args.image_size is not None and args.image_size < 32:
+        parser.error("--image-size must be at least 32")
+    if args.max_steps is not None and args.max_steps < 1:
+        parser.error("--max-steps must be positive")
+    if args.model in {"efficientad", "all"} and (
+        not args.teacher_checkpoint or not args.imagenet_penalty_dir
+    ):
+        print(
+            "EfficientAD runs will be recorded as failed unless --teacher-checkpoint and --imagenet-penalty-dir are supplied.",
+            file=sys.stderr,
+        )
+
+    run_root = ROOT / "runs" / "benchmark"
+    run_root.mkdir(parents=True, exist_ok=True)
+    tracking = configure_local_mlflow(ROOT, mlflow)
+    invocation_id = datetime.now(UTC).strftime("%Y%m%dT%H%M%SZ")
+    failed_count = 0
+
+    for dataset in datasets:
+        with mlflow.start_run(
+            run_name=f"benchmark-{dataset}-{invocation_id}"
+        ) as parent:
+            mlflow.set_tags(
+                {
+                    "run_role": "benchmark_dataset_parent",
+                    "dataset": dataset,
+                    "phase": "4",
+                }
+            )
+            for category in categories_by_dataset[dataset]:
+                for model_name in model_names:
+                    placeholder = run_root / "_id"
+                    resources = _resource_fingerprints(
+                        dataset,
+                        model_name,
+                        args.teacher_checkpoint,
+                        args.imagenet_penalty_dir,
+                    )
+                    run_config = _make_run_config(
+                        model_name, dataset, category, args, placeholder
+                    )
+                    if model_name == "efficientad" and args.max_steps is not None:
+                        run_config["max_steps"] = args.max_steps
+                    run_config["resource_fingerprints"] = resources
+                    if model_name == "efficientad":
+                        run_config["teacher_checkpoint"] = args.teacher_checkpoint
+                        run_config["imagenet_penalty_dir"] = args.imagenet_penalty_dir
+                    run_id = experiment_id(
+                        dataset=dataset,
+                        category=category,
+                        model=model_name,
+                        seed=args.seed,
+                        config=redact_config(run_config),
+                    )
+                    experiment_dir = run_root / run_id
+                    prior_state = latest_attempt_state(experiment_dir)
+                    if prior_state == "completed":
+                        print(f"SKIP completed {run_id}")
+                        continue
+                    attempt = next_attempt_number(experiment_dir)
+                    attempt_dir = experiment_dir / f"attempt-{attempt:03d}"
+                    if attempt_dir.exists():
+                        raise RuntimeError(
+                            f"Refusing to overwrite existing attempt: {attempt_dir}"
+                        )
+                    config_path = attempt_dir / "config.json"
+                    run_config = _make_run_config(
+                        model_name, dataset, category, args, attempt_dir
+                    )
+                    if model_name == "efficientad" and args.max_steps is not None:
+                        run_config["max_steps"] = args.max_steps
+                    run_config["resource_fingerprints"] = resources
+                    if model_name == "efficientad":
+                        run_config["teacher_checkpoint"] = args.teacher_checkpoint
+                        run_config["imagenet_penalty_dir"] = args.imagenet_penalty_dir
+                    safe_config = redact_config(run_config)
+                    _write_json(config_path, run_config)
+                    _write_json(attempt_dir / "config.redacted.json", safe_config)
+                    env_path = attempt_dir / "environment.json"
+                    _write_json(
+                        env_path,
+                        environment_metadata(
+                            [MODEL_CONFIGS[model_name], DATASET_CONFIG], args.seed
+                        ),
+                    )
+                    status = {
+                        "experiment_id": run_id,
+                        "dataset": dataset,
+                        "category": category,
+                        "model": model_name,
+                        "state": "running",
+                        "attempt": attempt,
+                        "started_at": datetime.now(UTC).isoformat(),
+                        "parent_mlflow_run_id": parent.info.run_id,
+                    }
+                    _write_json(attempt_dir / "status.json", status)
+                    run_name = (
+                        f"{dataset}-{category}-{model_name}-s{args.seed}-{run_id[-6:]}"
+                    )
+                    print(f"RUN {run_name} ({attempt_dir.relative_to(ROOT)})")
+                    train_log = attempt_dir / "train.log"
+                    eval_log = attempt_dir / "evaluate.log"
+                    metrics_path = attempt_dir / "metrics" / f"{category}.json"
+                    with mlflow.start_run(run_name=run_name, nested=True) as child:
+                        mlflow.set_tags(
+                            {
+                                "run_role": "benchmark_model_category",
+                                "experiment_id": run_id,
+                                "dataset": dataset,
+                                "category": category,
+                                "model": model_name,
+                                "model_version": "1",
+                                "parent_run_id": parent.info.run_id,
+                            }
+                        )
+                        mlflow.log_params(
+                            {
+                                "seed": args.seed,
+                                "backbone": run_config.get(
+                                    "backbone", "efficientad-pdn"
+                                ),
+                                "input_resolution": run_config["image_size"],
+                                "batch_size": run_config["batch_size"],
+                                "config_sha256": hashlib.sha256(
+                                    canonical_json(safe_config).encode()
+                                ).hexdigest(),
+                                "hyperparameters": canonical_json(
+                                    safe_config.get("hyperparameters", {})
+                                )[:450],
+                            }
+                        )
+                        try:
+                            if model_name == "efficientad" and (
+                                not args.teacher_checkpoint
+                                or not args.imagenet_penalty_dir
+                            ):
+                                raise ValueError(
+                                    "EfficientAD requires explicit --teacher-checkpoint and --imagenet-penalty-dir paths"
+                                )
+                            if (
+                                model_name in {"padim", "patchcore"}
+                                and run_config.get("pretrained", True)
+                                and not args.allow_pretrained_download
+                            ):
+                                weight_name = {
+                                    "resnet18": "resnet18-f37072fd.pth",
+                                    "resnet34": "resnet34-b627a593.pth",
+                                    "resnet50": "resnet50-11ad3fa6.pth",
+                                    "wide_resnet50_2": "wide_resnet50_2-9ba9bcbe.pth",
+                                }.get(run_config.get("backbone"))
+                                cached_weights = (
+                                    Path(
+                                        os.environ.get(
+                                            "TORCH_HOME",
+                                            str(Path.home() / ".cache" / "torch"),
+                                        )
+                                    )
+                                    / "hub"
+                                    / "checkpoints"
+                                    / str(weight_name)
+                                )
+                                if not weight_name or not cached_weights.is_file():
+                                    raise FileNotFoundError(
+                                        "Pretrained torchvision weights are not cached; pass --allow-pretrained-download to permit an explicit download"
+                                    )
+                            _write_json(config_path, run_config)
+                            train_command = [
+                                sys.executable,
+                                str(ROOT / "scripts" / "train_model.py"),
+                                "--config",
+                                str(config_path),
+                            ]
+                            if args.allow_pretrained_download and model_name in {
+                                "padim",
+                                "patchcore",
+                            }:
+                                train_command.append("--allow-pretrained-download")
+                            eval_command = [
+                                sys.executable,
+                                str(ROOT / "scripts" / "evaluate_model.py"),
+                                "--config",
+                                str(config_path),
+                                "--output-dir",
+                                str(attempt_dir / "metrics"),
+                            ]
+                            for command in (train_command, eval_command):
+                                if (
+                                    args.teacher_checkpoint
+                                    and "efficientad" in model_name
+                                ):
+                                    command.extend(
+                                        (
+                                            "--teacher-checkpoint",
+                                            args.teacher_checkpoint,
+                                        )
+                                    )
+                                if (
+                                    args.imagenet_penalty_dir
+                                    and "efficientad" in model_name
+                                ):
+                                    command.extend(
+                                        (
+                                            "--imagenet-penalty-dir",
+                                            args.imagenet_penalty_dir,
+                                        )
+                                    )
+                            train_started = time.perf_counter()
+                            train_result = subprocess.run(
+                                train_command,
+                                cwd=ROOT,
+                                text=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                check=False,
+                            )
+                            training_seconds = time.perf_counter() - train_started
+                            train_log.write_text(
+                                _safe_text(train_result.stdout), encoding="utf-8"
+                            )
+                            if train_result.returncode:
+                                raise RuntimeError(
+                                    f"Training subprocess exited {train_result.returncode}: {train_result.stdout[-1600:]}"
+                                )
+                            eval_result = subprocess.run(
+                                eval_command,
+                                cwd=ROOT,
+                                text=True,
+                                stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT,
+                                check=False,
+                            )
+                            eval_log.write_text(
+                                _safe_text(eval_result.stdout), encoding="utf-8"
+                            )
+                            if eval_result.returncode:
+                                raise RuntimeError(
+                                    f"Evaluation subprocess exited {eval_result.returncode}: {eval_result.stdout[-1600:]}"
+                                )
+                            report = json.loads(
+                                metrics_path.read_text(encoding="utf-8")
+                            )
+                            category_row = report["per_category"][0]
+                            mlflow.log_metrics(metric_scalars(category_row))
+                            mlflow.log_metrics(
+                                {
+                                    f"runtime_{key}": float(value)
+                                    for key, value in report.get("runtime", {}).items()
+                                    if isinstance(value, (float, int))
+                                }
+                            )
+                            mlflow.log_metric(
+                                "training_duration_seconds", training_seconds
+                            )
+                            mlflow.log_artifact(
+                                str(
+                                    attempt_dir
+                                    / "checkpoints"
+                                    / model_name
+                                    / dataset
+                                    / category
+                                    / "model.pt"
+                                ),
+                                artifact_path="checkpoint",
+                            )
+                            mlflow.log_artifact(
+                                str(
+                                    attempt_dir
+                                    / "checkpoints"
+                                    / model_name
+                                    / dataset
+                                    / category
+                                    / "training_metadata.json"
+                                ),
+                                artifact_path="metadata",
+                            )
+                            mlflow.log_artifact(
+                                str(metrics_path), artifact_path="metrics"
+                            )
+                            mlflow.log_artifact(
+                                str(metrics_path.parent / "summary.json"),
+                                artifact_path="metrics",
+                            )
+                            mlflow.log_artifact(
+                                str(env_path), artifact_path="reproducibility"
+                            )
+                            mlflow.log_artifact(
+                                str(attempt_dir / "config.redacted.json"),
+                                artifact_path="configuration",
+                            )
+                            for log_path in (train_log, eval_log):
+                                mlflow.log_artifact(str(log_path), artifact_path="logs")
+                            images_dir = metrics_path.parent / "images"
+                            if images_dir.is_dir():
+                                mlflow.log_artifacts(
+                                    str(images_dir),
+                                    artifact_path="representative_images",
+                                )
+                            status.update(
+                                state="completed",
+                                finished_at=datetime.now(UTC).isoformat(),
+                                metrics_path=str(metrics_path),
+                                training_duration_seconds=training_seconds,
+                                mlflow_run_id=child.info.run_id,
+                            )
+                            print(f"DONE {run_name}")
+                        except Exception as exc:  # noqa: BLE001 - isolate each failed experiment
+                            failed_count += 1
+                            safe_error = _safe_text(f"{type(exc).__name__}: {exc}")
+                            status.update(
+                                state="failed",
+                                finished_at=datetime.now(UTC).isoformat(),
+                                error=safe_error,
+                                mlflow_run_id=child.info.run_id,
+                            )
+                            mlflow.set_tag("experiment_state", "failed")
+                            mlflow.set_tag("failure_reason", safe_error[:450])
+                            for path in (
+                                train_log,
+                                eval_log,
+                                env_path,
+                                attempt_dir / "config.redacted.json",
+                            ):
+                                if path.is_file():
+                                    mlflow.log_artifact(
+                                        str(path), artifact_path="failure_diagnostics"
+                                    )
+                            print(f"FAILED {run_name}: {exc}", file=sys.stderr)
+                        finally:
+                            _write_json(attempt_dir / "status.json", status)
+                    if status["state"] == "failed" and args.fail_fast:
+                        _aggregate(
+                            run_root, ROOT / "reports" / "benchmarks" / "aggregates"
+                        )
+                        return 1
+            _aggregate(run_root, ROOT / "reports" / "benchmarks" / "aggregates")
+    print(f"Benchmark selection finished; failures={failed_count}; tracking={tracking}")
+    return 1 if failed_count else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

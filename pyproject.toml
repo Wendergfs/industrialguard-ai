@@ -1,0 +1,31 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "industrialguard-ai"
+version = "0.1.0"
+description = "Read-only archive audit tools for IndustrialGuard AI datasets"
+requires-python = ">=3.11"
+dependencies = ["Pillow>=10.0", "torch>=2.2"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8.0", "ruff>=0.5", "mypy>=1.10"]
+analysis = ["matplotlib>=3.8"]
+models = ["torchvision>=0.25.0", "anomalib>=2.7.0,<3"]
+evaluation = ["numpy>=1.24", "scikit-learn>=1.3", "scipy>=1.10"]
+mlops = ["mlflow>=3.0,<4", "dvc>=3.50,<4"]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.mypy]
+python_version = "3.11"
+ignore_missing_imports = true
