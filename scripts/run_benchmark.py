@@ -49,9 +49,9 @@ TRACKED_PACKAGES = (
 )
 
 
-def environment_metadata(configs: list[Path], seed: int) -> dict:
+def environment_metadata(configs: list[Path], seed: int) -> dict[str, object]:
     """Capture portable versions and hashes, deliberately omitting user/host data."""
-    versions = {}
+    versions: dict[str, str | None] = {}
     for package in TRACKED_PACKAGES:
         try:
             versions[package] = metadata.version(package)
@@ -115,14 +115,14 @@ def _resource_fingerprints(
         ROOT / "scripts" / "evaluate_model.py",
         ROOT / "scripts" / "run_benchmark.py",
     )
-    source_files = []
+    source_files: list[Path] = []
     for source in source_roots:
         source_files.extend(source.rglob("*.py") if source.is_dir() else [source])
     for source in sorted(source_files):
         source_digest.update(source.relative_to(ROOT).as_posix().encode())
         source_digest.update(source.read_bytes())
     result["implementation_sha256"] = source_digest.hexdigest()
-    package_versions = {}
+    package_versions: dict[str, str | None] = {}
     for package in TRACKED_PACKAGES:
         try:
             package_versions[package] = metadata.version(package)
@@ -433,12 +433,17 @@ def main() -> int:
                                 and run_config.get("pretrained", True)
                                 and not args.allow_pretrained_download
                             ):
-                                weight_name = {
-                                    "resnet18": "resnet18-f37072fd.pth",
-                                    "resnet34": "resnet34-b627a593.pth",
-                                    "resnet50": "resnet50-11ad3fa6.pth",
-                                    "wide_resnet50_2": "wide_resnet50_2-9ba9bcbe.pth",
-                                }.get(run_config.get("backbone"))
+                                backbone = run_config.get("backbone")
+                                weight_name = (
+                                    {
+                                        "resnet18": "resnet18-f37072fd.pth",
+                                        "resnet34": "resnet34-b627a593.pth",
+                                        "resnet50": "resnet50-11ad3fa6.pth",
+                                        "wide_resnet50_2": "wide_resnet50_2-9ba9bcbe.pth",
+                                    }.get(backbone)
+                                    if isinstance(backbone, str)
+                                    else None
+                                )
                                 cached_weights = (
                                     Path(
                                         os.environ.get(
