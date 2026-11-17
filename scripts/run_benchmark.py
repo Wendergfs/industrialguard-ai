@@ -75,9 +75,49 @@ def environment_metadata(configs: list[Path], seed: int) -> dict[str, object]:
         "machine_architecture": platform.machine(),
         "packages": versions,
         "seed": seed,
+        "git_commit_sha": _git_commit_sha(),
+        "source_archive_sha256": os.environ.get(
+            "INDUSTRIALGUARD_SOURCE_ARCHIVE_SHA256"
+        ),
         "config_sha256": hashes,
         "torch_device_capability": device,
     }
+
+
+def _git_commit_sha() -> str | None:
+    """Return the source revision without recording a local checkout path."""
+    declared_version = os.environ.get("INDUSTRIALGUARD_CODE_VERSION")
+    if declared_version:
+        return declared_version.strip()
+    try:
+        result = subprocess.run(
+            ["git", "rev-parse", "HEAD"],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except (OSError, subprocess.CalledProcessError):
+        return None
+    return result.stdout.strip()
+
+
+def _code_version() -> str | None:
+    """Identify a source archive when a Colab ZIP has no Git metadata."""
+    commit = _git_commit_sha()
+    if commit:
+        return commit
+    archive_sha = os.environ.get("INDUSTRIALGUARD_SOURCE_ARCHIVE_SHA256")
+    return f"archive-sha256:{archive_sha}" if archive_sha else None
+
+
+def _sha256_file(path: Path) -> str:
+    """Hash a potentially large resource without loading it all into memory."""
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _write_json(path: Path, value) -> None:
@@ -105,6 +145,13 @@ def _resource_fingerprints(
         if inventory_path.is_file()
         else None
     }
+    dataset_config = read_config(DATASET_CONFIG)["datasets"][dataset]
+    archive = Path(dataset_config["archive"])
+    if not archive.is_absolute():
+        archive = ROOT / archive
+    result["dataset_archive_sha256"] = (
+        _sha256_file(archive) if archive.is_file() else None
+    )
     source_digest = hashlib.sha256()
     source_roots = (
         ROOT / "src" / "industrialguard" / "data",
@@ -136,7 +183,7 @@ def _resource_fingerprints(
     if model == "efficientad":
         teacher_path = Path(teacher_checkpoint) if teacher_checkpoint else None
         result["teacher_checkpoint_sha256"] = (
-            hashlib.sha256(teacher_path.read_bytes()).hexdigest()
+            _sha256_file(teacher_path)
             if teacher_path and teacher_path.is_file()
             else None
         )
@@ -164,7 +211,12 @@ def _make_run_config(
     args,
     output_dir: Path,
 ) -> dict:
-    base = read_config(MODEL_CONFIGS[model_name])
+    config_path = (
+        Path(args.config)
+        if args.config and model_name == args.model
+        else MODEL_CONFIGS[model_name]
+    )
+    base = read_config(config_path)
     base.update(
         dataset=dataset_name,
         categories=[category],
@@ -175,6 +227,15 @@ def _make_run_config(
         seed=args.seed,
         device=args.device,
         checkpoint_dir=str(output_dir / "checkpoints"),
+        threshold_method=args.threshold_method
+        or str(base.get("threshold_method", "normal_quantile")),
+        threshold_quantile=args.threshold_quantile
+        if args.threshold_quantile is not None
+        else float(base.get("threshold_quantile", 0.995)),
+        mad_multiplier=args.mad_multiplier
+        if args.mad_multiplier is not None
+        else float(base.get("mad_multiplier", 3.5)),
+        run_kind=args.run_kind,
     )
     return base
 
@@ -259,6 +320,27 @@ def main() -> int:
     )
     parser.add_argument("--seed", type=int, default=benchmark_defaults.get("seed", 42))
     parser.add_argument("--max-steps", type=int)
+    parser.add_argument(
+        "--config",
+        help="One model config override for a single-model, single-category experiment",
+    )
+    parser.add_argument("--max-train-images", type=int)
+    parser.add_argument("--limit-per-split", type=int)
+    parser.add_argument(
+        "--run-kind",
+        choices=("smoke_test", "baseline", "tuning", "final_benchmark"),
+        default="baseline",
+    )
+    parser.add_argument("--threshold-method", choices=("normal_quantile", "mad", "f1"))
+    parser.add_argument("--threshold-quantile", type=float)
+    parser.add_argument("--mad-multiplier", type=float)
+    parser.add_argument("--validation-manifest")
+    parser.add_argument("--validation-root")
+    parser.add_argument(
+        "--allow-massive",
+        action="store_true",
+        help="Explicitly allow more than three model/category runs per invocation",
+    )
     parser.add_argument("--teacher-checkpoint")
     parser.add_argument("--imagenet-penalty-dir")
     parser.add_argument(
@@ -268,17 +350,50 @@ def main() -> int:
     )
     parser.add_argument("--fail-fast", action="store_true")
     args = parser.parse_args()
+    if bool(args.validation_manifest) != bool(args.validation_root):
+        parser.error(
+            "--validation-manifest and --validation-root must be supplied together"
+        )
+    if args.threshold_method == "f1" and not args.validation_manifest:
+        parser.error(
+            "F1 threshold selection requires an independent labeled validation manifest"
+        )
+    if args.run_kind == "smoke_test" and args.limit_per_split is None:
+        parser.error("smoke_test runs require --limit-per-split")
+    if args.run_kind != "smoke_test" and args.limit_per_split is not None:
+        parser.error("--limit-per-split is reserved for runs tagged smoke_test")
+    if args.limit_per_split is not None and args.limit_per_split < 1:
+        parser.error("--limit-per-split must be positive")
+    if args.max_train_images is not None and args.max_train_images < 1:
+        parser.error("--max-train-images must be positive")
 
-    try:
-        import mlflow
-    except ImportError as exc:
-        raise SystemExit(
-            "MLflow is required: install with `python -m pip install -e .[mlops]`"
-        ) from exc
-
-    dataset_specs = read_config(DATASET_CONFIG)["datasets"]
+    # Category metadata is static; inspect it without expanding required data
+    # path environment variables so CLI safety guards run before preflight.
+    dataset_specs = json.loads(DATASET_CONFIG.read_text(encoding="utf-8"))["datasets"]
     datasets = list(dataset_specs) if args.dataset == "all" else [args.dataset]
     model_names = list(MODEL_CONFIGS) if args.model == "all" else [args.model]
+    custom_config = None
+    if args.config:
+        if args.model == "all" or args.all_categories or len(args.category or []) != 1:
+            parser.error("--config requires one --model and exactly one --category")
+        custom_config = read_config(args.config)
+        if custom_config.get("model") != args.model:
+            parser.error("--config model must match --model")
+    configured_threshold_methods = {
+        args.threshold_method
+        or str(
+            custom_config.get("threshold_method", "normal_quantile")
+            if custom_config is not None
+            else read_config(MODEL_CONFIGS[name]).get(
+                "threshold_method", "normal_quantile"
+            )
+        )
+        for name in model_names
+    }
+    if "f1" in configured_threshold_methods and not args.validation_manifest:
+        parser.error(
+            "F1 threshold selection requires an independent labeled validation manifest"
+        )
     categories_by_dataset = {}
     for dataset in datasets:
         known = dataset_specs[dataset]["categories"]
@@ -287,6 +402,13 @@ def main() -> int:
         if unknown:
             raise SystemExit(f"Unknown {dataset} categories: {unknown}")
         categories_by_dataset[dataset] = categories
+    planned_runs = sum(
+        len(categories) for categories in categories_by_dataset.values()
+    ) * len(model_names)
+    if planned_runs > 3 and not args.allow_massive:
+        parser.error(
+            f"This invocation plans {planned_runs} runs; stage the work or explicitly pass --allow-massive."
+        )
     if args.batch_size is not None and args.batch_size < 1:
         parser.error("--batch-size must be positive")
     if args.image_size is not None and args.image_size < 32:
@@ -300,6 +422,13 @@ def main() -> int:
             "EfficientAD runs will be recorded as failed unless --teacher-checkpoint and --imagenet-penalty-dir are supplied.",
             file=sys.stderr,
         )
+
+    try:
+        import mlflow
+    except ImportError as exc:
+        raise SystemExit(
+            "MLflow is required: install with `python -m pip install -e .[mlops]`"
+        ) from exc
 
     run_root = ROOT / "runs" / "benchmark"
     run_root.mkdir(parents=True, exist_ok=True)
@@ -315,7 +444,10 @@ def main() -> int:
                 {
                     "run_role": "benchmark_dataset_parent",
                     "dataset": dataset,
-                    "phase": "4",
+                    "phase": "7",
+                    "run_kind": args.run_kind,
+                    "threshold_method": args.threshold_method or "normal_quantile",
+                    "code_version": _code_version() or "unknown",
                 }
             )
             for category in categories_by_dataset[dataset]:
@@ -371,7 +503,13 @@ def main() -> int:
                     _write_json(
                         env_path,
                         environment_metadata(
-                            [MODEL_CONFIGS[model_name], DATASET_CONFIG], args.seed
+                            [
+                                Path(args.config)
+                                if args.config and model_name == args.model
+                                else MODEL_CONFIGS[model_name],
+                                DATASET_CONFIG,
+                            ],
+                            args.seed,
                         ),
                     )
                     status = {
@@ -402,6 +540,9 @@ def main() -> int:
                                 "model": model_name,
                                 "model_version": "1",
                                 "parent_run_id": parent.info.run_id,
+                                "run_kind": args.run_kind,
+                                "threshold_method": run_config["threshold_method"],
+                                "code_version": _code_version() or "unknown",
                             }
                         )
                         mlflow.log_params(
@@ -466,6 +607,14 @@ def main() -> int:
                                 "--config",
                                 str(config_path),
                             ]
+                            if args.limit_per_split is not None:
+                                train_command.extend(
+                                    ("--limit-per-split", str(args.limit_per_split))
+                                )
+                            if args.max_train_images is not None:
+                                train_command.extend(
+                                    ("--max-train-images", str(args.max_train_images))
+                                )
                             if args.allow_pretrained_download and model_name in {
                                 "padim",
                                 "patchcore",
@@ -479,6 +628,19 @@ def main() -> int:
                                 "--output-dir",
                                 str(attempt_dir / "metrics"),
                             ]
+                            if args.limit_per_split is not None:
+                                eval_command.extend(
+                                    ("--limit-per-split", str(args.limit_per_split))
+                                )
+                            if args.validation_manifest and args.validation_root:
+                                eval_command.extend(
+                                    (
+                                        "--validation-manifest",
+                                        args.validation_manifest,
+                                        "--validation-root",
+                                        args.validation_root,
+                                    )
+                                )
                             for command in (train_command, eval_command):
                                 if (
                                     args.teacher_checkpoint
@@ -536,6 +698,11 @@ def main() -> int:
                                 metrics_path.read_text(encoding="utf-8")
                             )
                             category_row = report["per_category"][0]
+                            calibration_sha256 = report.get("calibration_data_sha256")
+                            if calibration_sha256:
+                                mlflow.set_tag(
+                                    "calibration_data_sha256", calibration_sha256
+                                )
                             mlflow.log_metrics(metric_scalars(category_row))
                             mlflow.log_metrics(
                                 {
@@ -547,6 +714,35 @@ def main() -> int:
                             mlflow.log_metric(
                                 "training_duration_seconds", training_seconds
                             )
+                            mlflow.log_metric(
+                                "training_subprocess_duration_seconds",
+                                training_seconds,
+                            )
+                            training_metadata_path = (
+                                attempt_dir
+                                / "checkpoints"
+                                / model_name
+                                / dataset
+                                / category
+                                / "training_metadata.json"
+                            )
+                            training_metadata = json.loads(
+                                training_metadata_path.read_text(encoding="utf-8")
+                            )
+                            fit_duration = training_metadata.get(
+                                "training_duration_seconds"
+                            )
+                            if isinstance(fit_duration, (float, int)):
+                                mlflow.log_metric(
+                                    "model_fit_duration_seconds", float(fit_duration)
+                                )
+                            fit_peak_memory = training_metadata.get(
+                                "training_peak_memory_bytes"
+                            )
+                            if isinstance(fit_peak_memory, (float, int)):
+                                mlflow.log_metric(
+                                    "training_peak_memory_bytes", float(fit_peak_memory)
+                                )
                             mlflow.log_artifact(
                                 str(
                                     attempt_dir
@@ -596,6 +792,7 @@ def main() -> int:
                                 finished_at=datetime.now(UTC).isoformat(),
                                 metrics_path=str(metrics_path),
                                 training_duration_seconds=training_seconds,
+                                model_fit_duration_seconds=fit_duration,
                                 mlflow_run_id=child.info.run_id,
                             )
                             print(f"DONE {run_name}")

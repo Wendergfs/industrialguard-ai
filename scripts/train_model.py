@@ -169,6 +169,8 @@ def main() -> None:
             }
         )
         training_started = time.perf_counter()
+        if device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(device)
         if model_name == "efficientad":
             penalty_dir = args.imagenet_penalty_dir or config.get(
                 "imagenet_penalty_dir"
@@ -198,6 +200,11 @@ def main() -> None:
             )
         else:
             model.fit(data.train_dataloader(), data.val_dataloader())
+        if device.type == "cuda":
+            torch.cuda.synchronize(device)
+            training_peak_memory_bytes = int(torch.cuda.max_memory_allocated(device))
+        else:
+            training_peak_memory_bytes = None
 
         validation = _collect(model, data.val_dataloader(), device)
         val = validation[category]
@@ -235,6 +242,7 @@ def main() -> None:
                     "image_threshold": image_threshold,
                     "pixel_threshold": pixel_threshold,
                     "threshold_source": "normal validation quantile",
+                    "training_peak_memory_bytes": training_peak_memory_bytes,
                     "checkpoint": str(target.relative_to(project_root))
                     if target.is_relative_to(project_root)
                     else target.name,
