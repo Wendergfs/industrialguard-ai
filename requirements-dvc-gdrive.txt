@@ -1,0 +1,5 @@
+# Isolated DVC Google Drive backend environment.
+# AsyncSSH 2.24+ requires cryptography >=48, while PyDrive2/pyOpenSSL currently require <44.
+dvc[gdrive]==3.67.1
+asyncssh==2.23.1
+cryptography==43.0.3
