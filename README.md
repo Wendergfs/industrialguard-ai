@@ -99,7 +99,45 @@ The project’s own model code uses PyTorch. Optional model dependencies include
 
 ## DVC
 
-Keep the original archives outside Git. Phase 4 uses DVC only for audit reports, manifests, configs and reproducibility metadata. It does not track dataset archives or generated model/cache artifacts, and it does not configure a DVC remote.
+Keep the original archives outside Git. DVC tracks the project configs, dataset audit reports/manifests, experimental protocol, and reproducibility metadata; it does not track the MPDD/MVTec source archives, local training cache, checkpoints, or MLflow database. The default remote is the private Google Drive folder `dvc-storage`:
+
+```text
+gdrive://1YgvCVLg1IBZP_kwNDTQjFy4RTR7-3wP4
+```
+
+The Google Drive backend currently has an upstream dependency conflict with DVC's SSH support: PyDrive2 caps
+`pyOpenSSL` at 24.2.1, which requires `cryptography<44`, while current AsyncSSH requires
+`cryptography>=48.0.1`. Keep the project environment's SSH and crypto stack intact and install the DVC Google Drive
+backend in a separate environment using the compatibility constraints in `requirements-dvc-gdrive.txt`:
+
+```powershell
+$env:PIP_CACHE_DIR = "$PWD/.cache/pip"
+New-Item -ItemType Directory -Force .cache | Out-Null
+python -m venv .cache/dvc-gdrive-env
+.\.cache\dvc-gdrive-env\Scripts\python.exe -m pip install -r requirements-dvc-gdrive.txt
+```
+
+The shared remote URL and default are recorded in `.dvc/config`; private OAuth credentials are never stored there or in Git. On the first remote operation, DVC opens Google's OAuth authorization flow. Sign in with a Google account that has access to `dvc-storage` and approve DVC. This checkout stores the OAuth token at the path configured in ignored `.dvc/config.local`, under `.cache/dvc/gdrive/`. If custom OAuth settings are needed, use `dvc remote modify --local`; `.dvc/config.local` is Git-ignored. Never commit token files, client secrets, or `.dvc/config.local`.
+
+Use the following commands to check, upload, or retrieve DVC-tracked content:
+
+```powershell
+.\.cache\dvc-gdrive-env\Scripts\python.exe -m dvc status
+.\.cache\dvc-gdrive-env\Scripts\python.exe -m dvc push
+.\.cache\dvc-gdrive-env\Scripts\python.exe -m dvc pull
+```
+
+On another machine, clone the Git repository, create the DVC environment above, complete OAuth, then run the `dvc pull` command from the block above; the shared default remote is already recorded in `.dvc/config`. In Google Colab, install `requirements-dvc-gdrive.txt` in the runtime before using DVC and complete OAuth there. Do not copy OAuth token files into the notebook, Drive artifacts, or the repository.
+
+If Google's default DVC OAuth application reports that the app is blocked, create a Google Cloud project for your own DVC client. Enable the **Google Drive API**. In **Google Auth Platform**, configure the consent screen; for a personal Gmail account choose **External**, leave the app in **Testing**, and add the Google account you will use as a test user. Declare the two scopes DVC requests: `https://www.googleapis.com/auth/drive` and `https://www.googleapis.com/auth/drive.appdata`. Under **Clients**, create an OAuth client of type **Desktop app**. Google’s [Drive API quickstart](https://developers.google.com/workspace/drive/api/quickstart/python) and [OAuth Desktop App guide](https://developers.google.com/identity/protocols/oauth2/native-app) describe these steps.
+
+Set that client's ID and secret only in the ignored local DVC configuration. This helper asks for the ID and prompts for the secret without displaying it:
+
+```powershell
+.\.cache\dvc-gdrive-env\Scripts\python.exe scripts\configure_dvc_gdrive_oauth.py
+```
+
+Do not put these values in `.dvc/config`, Git, a notebook, or chat. Then rerun a DVC remote command and complete the browser authorization. In Google's Testing mode, Drive authorizations expire after 7 days; persistent use may require publishing and completing Google's verification requirements. See the [DVC Google Drive remote guide](https://dvc.org/doc/user-guide/data-management/remote-storage/google-drive) and Google's [testing-mode token policy](https://developers.google.com/identity/protocols/oauth2#expiration).
 
 ## Phase 4: reproducible benchmark and MLOps
 
@@ -161,14 +199,14 @@ Before benchmark use, create the baseline environment fingerprint and initialize
 .\.venv\Scripts\python.exe scripts/setup_dvc.py
 ```
 
-DVC versions `configs/`, the dataset audit reports/manifests, the experimental protocol and `reports/reproducibility/environment.json` in the local `.dvc/cache`. It does not add source archives, `.cache/`, checkpoints, or benchmark outputs. No DVC remote exists. In restricted Windows environments, DVC's internal site cache can be placed inside the ignored project cache for commands:
+DVC versions `configs/`, the dataset audit reports/manifests, the experimental protocol and `reports/reproducibility/environment.json` in the local `.dvc/cache`. It does not add source archives, `.cache/`, checkpoints, or benchmark outputs. The shared default remote is configured in `.dvc/config`; its authentication and synchronization must be verified on each machine before relying on remote copies. In restricted Windows environments, DVC's internal site cache can be placed inside the ignored project cache for commands:
 
 ```powershell
 $env:DVC_SITE_CACHE_DIR = "$PWD/.cache/dvc/site"
-.\.venv\Scripts\python.exe -m dvc status
+.\.cache\dvc-gdrive-env\Scripts\python.exe -m dvc status
 ```
 
-The generated `.dvc` pointer files and `.dvc/config` are intended for Git; no commit is created automatically. A future remote should be agreed and configured explicitly, for example `dvc remote add -d <name> <approved-url>` after credentials and access policy are settled. Do not put secrets in `.dvc/config`.
+The generated `.dvc` pointer files and shared remote configuration are intended for Git; no commit is created automatically. OAuth credentials belong only in ignored local configuration or DVC's local credential cache. Do not put secrets in `.dvc/config`.
 
 For a local-only tracking UI, start it manually from the project root when desired:
 
@@ -200,7 +238,7 @@ AUROC, average precision, and AUPRO are threshold-free. Dice, IoU, precision, re
 
 The checkpoint, per-sample test scores/maps/masks, representative visualizations, logs, config, and MLflow run artifacts were exported to `MyDrive/IndustrialGuardAI/artifacts/experiments/mpdd-bracket_black-padim-s42-5f1a9479e4a6/`. MLflow run `9134a8cea01e4a0dbd474adcecf32600` was retrieved after logging. Its SQLite tracking database was local to the temporary Colab runtime; the artifact bundle and run summary are the persistent Drive export. Checkpoints and MLflow databases are not stored in Git.
 
-This repository has no GitHub or DVC remote configured. DVC-tracked configs and audit/report payloads are available in the local checkout and source ZIP, but a GitHub clone alone cannot retrieve those payloads without an approved DVC remote. No repository URL or storage backend is inferred.
+The Git repository is hosted at [Wendergfs/industrialguard-ai](https://github.com/Wendergfs/industrialguard-ai). Its Git history contains the DVC pointer files and shared Google Drive remote configuration; a fresh clone still needs Google OAuth and a successful `dvc pull` before it has the DVC-tracked payloads locally.
 
 ### Resource planning (estimates, not measurements)
 
