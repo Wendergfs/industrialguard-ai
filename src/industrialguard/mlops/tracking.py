@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import json
 import urllib.parse
 from pathlib import Path
@@ -67,7 +68,7 @@ def tracking_uri(project_root: Path) -> str:
 def configure_local_mlflow(project_root: Path, mlflow_module=None) -> str:
     """Configure a persistent local SQLite store and local artifact root only."""
     if mlflow_module is None:
-        import mlflow as mlflow_module
+        mlflow_module = importlib.import_module("mlflow")
     root = (project_root / "runs" / "mlflow").resolve()
     root.mkdir(parents=True, exist_ok=True)
     uri = tracking_uri(project_root)
