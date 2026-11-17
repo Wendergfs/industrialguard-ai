@@ -55,8 +55,8 @@ def test_threshold_inputs_reject_invalid_values():
 
 def test_aupro_matches_anomalib_reference_on_ties_and_diagonal_components():
     pytest.importorskip("anomalib.metrics")
-    from anomalib.metrics.aupro import _AUPRO
     import torch
+    from anomalib.metrics.aupro import _AUPRO
 
     masks = np.zeros((2, 5, 5), dtype=bool)
     masks[0, 1, 1] = True
