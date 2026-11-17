@@ -112,6 +112,10 @@ python -m pip check
 
 CI uses synthetic test fixtures; it does not require dataset files, Google Drive credentials, DVC OAuth, the DVC remote, or a GPU. Notebook Ruff findings are reported in a separate informational job; CI does not rewrite notebooks. The existing notebook findings should be addressed later in a dedicated notebook cleanup change that preserves outputs, metadata, and cell results.
 
+## Phase 7 research protocol
+
+The controlled model and threshold tuning plan, independent validation manifest format, and test-separation rules are documented in [phase7_experimental_protocol.md](docs/research/phase7_experimental_protocol.md). Tuning runs remain blocked until the independent labeled validation set is available.
+
 ## Dependencies and licenses
 
 The project’s own model code uses PyTorch. Optional model dependencies include Torchvision and Anomalib; evaluation uses scikit-learn and SciPy. Anomalib is Apache-2.0; Torchvision is BSD-3-Clause. EfficientAD implementation provenance and license links are recorded in the [experimental protocol](reports/model_development/experimental_protocol.md). Pretrained weights and datasets retain their upstream terms; do not redistribute them without checking those terms.
