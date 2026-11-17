@@ -1,5 +1,7 @@
 # IndustrialGuard AI
 
+[![CI](https://github.com/Wendergfs/industrialguard-ai/actions/workflows/ci.yml/badge.svg)](https://github.com/Wendergfs/industrialguard-ai/actions/workflows/ci.yml)
+
 Industrial visual anomaly detection research project. Phase 1 audits MPDD and MVTec AD; Phase 2 provides the archive-aware PyTorch data pipeline; Phase 3 implements PaDiM, PatchCore, and EfficientAD interfaces, training/inference scripts, thresholds, and evaluation metrics. Training is always an explicit command. No full-scale experiment starts automatically.
 
 MPDD is reported as the primary mechanical-component benchmark. MVTec AD is a broader complementary industrial anomaly benchmark. Their test data and aggregate scores are kept separate.
@@ -92,6 +94,23 @@ mypy src/industrialguard
 ```
 
 Ordinary unit tests use synthetic data and CPU inference. The real data cache is used only by explicit smoke/training commands.
+
+## CI/CD
+
+GitHub Actions runs on pushes and pull requests targeting `master`, and can also be started manually with `workflow_dispatch`. The workflow runs CPU tests on Python 3.11, Ruff lint and formatting checks, Mypy, and a dependency consistency check. A JUnit report is uploaded for each run and the test counts appear in the Actions summary.
+
+Run the same core checks locally after installing the project test extras and MLflow:
+
+```bash
+python -m pip install -e ".[dev,evaluation,models]" "mlflow>=3.0,<4"
+python -m pytest
+ruff check src/ scripts/ tests/
+ruff format --check src/ scripts/ tests/
+mypy src scripts
+python -m pip check
+```
+
+CI uses synthetic test fixtures; it does not require dataset files, Google Drive credentials, DVC OAuth, the DVC remote, or a GPU. Notebook Ruff findings are reported in a separate informational job; CI does not rewrite notebooks. The existing notebook findings should be addressed later in a dedicated notebook cleanup change that preserves outputs, metadata, and cell results.
 
 ## Dependencies and licenses
 
